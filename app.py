@@ -7,16 +7,14 @@ from dotenv import load_dotenv
 from models import db, User, AnalysisResult
 from mapreduce import run_mapreduce
 import tempfile
-from sqlalchemy import text, inspect
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-change-in-prod')
-DATABASE_URL = os.getenv('DATABASE_URL')
-if not DATABASE_URL:
-    DATABASE_URL = 'sqlite:///test.db'
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
+if not app.config['SQLALCHEMY_DATABASE_URI']:
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///test.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
@@ -29,76 +27,20 @@ login_manager.login_view = 'login'
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# ------------------- DIALECT DETECTION -------------------
-def is_sqlite():
-    return DATABASE_URL.startswith('sqlite')
-
-# ------------------- MIGRATION HELPERS -------------------
-def column_exists(table_name, column_name):
-    inspector = inspect(db.engine)
-    columns = [col['name'] for col in inspector.get_columns(table_name)]
-    return column_name in columns
-
-def add_column_if_missing(table_name, column_name, column_type, default_value=None):
-    if not column_exists(table_name, column_name):
-        with db.engine.connect() as conn:
-            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
-            conn.commit()
-        print(f"Added column '{column_name}' to table '{table_name}'.")
-        if default_value is not None:
-            with db.engine.connect() as conn:
-                conn.execute(text(f"UPDATE {table_name} SET {column_name} = {default_value} WHERE {column_name} IS NULL"))
-                conn.commit()
-            print(f"Set default value for '{column_name}' to '{default_value}'.")
-
-def add_foreign_key_if_missing():
-    # Add user_id column if missing
-    if not column_exists('analysis_result', 'user_id'):
-        add_column_if_missing('analysis_result', 'user_id', 'INTEGER')
-    
-    # Only add foreign key for PostgreSQL (not SQLite)
-    if not is_sqlite():
-        with db.engine.connect() as conn:
-            try:
-                # Quote "user" because it's a reserved keyword in PostgreSQL
-                conn.execute(text('ALTER TABLE analysis_result ADD CONSTRAINT fk_user_id FOREIGN KEY (user_id) REFERENCES "user"(id)'))
-                conn.commit()
-                print("Added foreign key constraint fk_user_id.")
-            except Exception as e:
-                # If the constraint already exists or any other error, ignore it
-                print(f"Note: Foreign key constraint not added (may already exist): {e}")
-
-# ------------------- DB INIT & MIGRATIONS -------------------
+# Create tables and admin
 with app.app_context():
     db.create_all()
-
-    # Add 'role' column if missing
-    if not column_exists('user', 'role'):
-        add_column_if_missing('user', 'role', 'VARCHAR(20)', "'user'")
-
-    # Add user_id and foreign key
-    add_foreign_key_if_missing()
-
-    # Ensure admin user exists
-    admin_username = os.getenv('ADMIN_USERNAME', 'admin')
-    admin_password = os.getenv('ADMIN_PASSWORD', 'admin123')
-    admin = User.query.filter_by(username=admin_username).first()
-    if not admin:
-        admin = User(
-            username=admin_username,
-            password_hash=generate_password_hash(admin_password),
+    admin_user = User.query.filter_by(username=os.getenv('ADMIN_USERNAME', 'admin')).first()
+    if not admin_user:
+        admin_user = User(
+            username=os.getenv('ADMIN_USERNAME', 'admin'),
+            password_hash=generate_password_hash(os.getenv('ADMIN_PASSWORD', 'admin123')),
             role='admin'
         )
-        db.session.add(admin)
+        db.session.add(admin_user)
         db.session.commit()
-        print(f"Admin '{admin_username}' created with role 'admin'.")
-    else:
-        if admin.role != 'admin':
-            admin.role = 'admin'
-            db.session.commit()
-            print(f"Updated admin '{admin_username}' role to 'admin'.")
+        print("Admin created")
 
-# ------------------- ROUTES -------------------
 @app.route('/')
 def index():
     return redirect(url_for('login'))
@@ -106,29 +48,22 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password_hash, password):
+        user = User.query.filter_by(username=request.form['username']).first()
+        if user and check_password_hash(user.password_hash, request.form['password']):
             login_user(user)
-            if user.role == 'admin':
-                return redirect(url_for('admin_dashboard'))
-            else:
-                return redirect(url_for('user_dashboard'))
+            return redirect(url_for('admin_dashboard' if user.role == 'admin' else 'user_dashboard'))
         flash('Invalid credentials')
     return render_template('login.html')
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if User.query.filter_by(username=username).first():
-            flash('Username already taken.')
+        if User.query.filter_by(username=request.form['username']).first():
+            flash('Username taken')
             return redirect(url_for('register'))
         new_user = User(
-            username=username,
-            password_hash=generate_password_hash(password),
+            username=request.form['username'],
+            password_hash=generate_password_hash(request.form['password']),
             role='user'
         )
         db.session.add(new_user)
@@ -147,40 +82,28 @@ def logout():
 @login_required
 def upload():
     if request.method == 'POST':
-        if 'logfile' not in request.files:
-            flash('No file part')
+        file = request.files.get('logfile')
+        if not file or not file.filename.endswith('.log'):
+            flash('Only .log files allowed')
             return redirect(request.url)
-        file = request.files['logfile']
-        if file.filename == '':
-            flash('No selected file')
-            return redirect(request.url)
-        if not file.filename.endswith('.log'):
-            flash('Only .log files are allowed')
-            return redirect(request.url)
-
         filename = secure_filename(file.filename)
-        tmp_path = None
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.log')
+        file.save(tmp.name)
+        tmp.close()
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.log') as tmp:
-                file.save(tmp.name)
-                tmp_path = tmp.name
-            error_counts, hour_counts = run_mapreduce(tmp_path)
+            errors, hours = run_mapreduce(tmp.name)
             result = AnalysisResult(
                 filename=filename,
-                error_counts=error_counts,
-                hour_counts=hour_counts,
+                error_counts=errors,
+                hour_counts=hours,
                 user_id=current_user.id
             )
             db.session.add(result)
             db.session.commit()
-            flash('File processed successfully!')
+            flash('File processed')
             return redirect(url_for('view_result', result_id=result.id))
-        except Exception as e:
-            flash(f'Processing failed: {str(e)}')
-            return redirect(request.url)
         finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            os.unlink(tmp.name)
     return render_template('upload.html')
 
 @app.route('/result/<int:result_id>')
@@ -196,29 +119,27 @@ def view_result(result_id):
 def admin_dashboard():
     if current_user.role != 'admin':
         abort(403)
-    all_results = AnalysisResult.query.order_by(AnalysisResult.uploaded_at.desc()).all()
-    users = User.query.all()
-    return render_template('admin_dashboard.html', results=all_results, users=users)
+    return render_template('admin_dashboard.html',
+        results=AnalysisResult.query.all(),
+        users=User.query.all())
 
 @app.route('/user')
 @login_required
 def user_dashboard():
     if current_user.role != 'user':
         return redirect(url_for('admin_dashboard'))
-    my_results = AnalysisResult.query.filter_by(user_id=current_user.id).order_by(AnalysisResult.uploaded_at.desc()).all()
-    return render_template('user_dashboard.html', results=my_results)
+    return render_template('user_dashboard.html',
+        results=AnalysisResult.query.filter_by(user_id=current_user.id).all())
 
 @app.route('/history')
 @login_required
 def history():
     if current_user.role == 'admin':
-        results = AnalysisResult.query.order_by(AnalysisResult.uploaded_at.desc()).all()
+        results = AnalysisResult.query.all()
     else:
-        results = AnalysisResult.query.filter_by(user_id=current_user.id).order_by(AnalysisResult.uploaded_at.desc()).all()
+        results = AnalysisResult.query.filter_by(user_id=current_user.id).all()
     return render_template('history.html', results=results)
 
-# ------------------- RUN APP (production ready) -------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('FLASK_DEBUG', 'False') == 'True'
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+    app.run(host='0.0.0.0', port=port, debug=False)
