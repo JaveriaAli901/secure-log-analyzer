@@ -31,10 +31,9 @@ def load_user(user_id):
 
 # ------------------- DIALECT DETECTION -------------------
 def is_sqlite():
-    """Return True if the database is SQLite (for local testing)."""
     return DATABASE_URL.startswith('sqlite')
 
-# ------------------- MIGRATION HELPERS (add missing columns) -------------------
+# ------------------- MIGRATION HELPERS -------------------
 def column_exists(table_name, column_name):
     inspector = inspect(db.engine)
     columns = [col['name'] for col in inspector.get_columns(table_name)]
@@ -53,36 +52,34 @@ def add_column_if_missing(table_name, column_name, column_type, default_value=No
             print(f"Set default value for '{column_name}' to '{default_value}'.")
 
 def add_foreign_key_if_missing():
-    """Add user_id column to analysis_result, but skip FOREIGN KEY for SQLite."""
-    # First, add the column if it doesn't exist
+    # Add user_id column if missing
     if not column_exists('analysis_result', 'user_id'):
         add_column_if_missing('analysis_result', 'user_id', 'INTEGER')
     
-    # Only add the FOREIGN KEY constraint for PostgreSQL (not SQLite)
+    # Only add foreign key for PostgreSQL (not SQLite)
     if not is_sqlite():
-        # Check if constraint already exists (simple check: try to add it)
         with db.engine.connect() as conn:
             try:
-                conn.execute(text("ALTER TABLE analysis_result ADD CONSTRAINT fk_user_id FOREIGN KEY (user_id) REFERENCES user(id)"))
+                # Quote "user" because it's a reserved keyword in PostgreSQL
+                conn.execute(text('ALTER TABLE analysis_result ADD CONSTRAINT fk_user_id FOREIGN KEY (user_id) REFERENCES "user"(id)'))
                 conn.commit()
                 print("Added foreign key constraint fk_user_id.")
             except Exception as e:
-                print(f"Foreign key constraint probably already exists: {e}")
+                # If the constraint already exists or any other error, ignore it
+                print(f"Note: Foreign key constraint not added (may already exist): {e}")
 
 # ------------------- DB INIT & MIGRATIONS -------------------
 with app.app_context():
-    # Create all tables (if they don't exist)
     db.create_all()
 
-    # 1. Add 'role' column to 'user' if missing
+    # Add 'role' column if missing
     if not column_exists('user', 'role'):
         add_column_if_missing('user', 'role', 'VARCHAR(20)', "'user'")
-        print("Added 'role' column to 'user' table with default 'user'.")
 
-    # 2. Add 'user_id' to 'analysis_result' if missing (and handle foreign key)
+    # Add user_id and foreign key
     add_foreign_key_if_missing()
 
-    # Ensure admin user exists with role='admin'
+    # Ensure admin user exists
     admin_username = os.getenv('ADMIN_USERNAME', 'admin')
     admin_password = os.getenv('ADMIN_PASSWORD', 'admin123')
     admin = User.query.filter_by(username=admin_username).first()
@@ -96,13 +93,12 @@ with app.app_context():
         db.session.commit()
         print(f"Admin '{admin_username}' created with role 'admin'.")
     else:
-        # If admin exists but role is not 'admin', update it
         if admin.role != 'admin':
             admin.role = 'admin'
             db.session.commit()
             print(f"Updated admin '{admin_username}' role to 'admin'.")
 
-# ------------------- ROUTES (unchanged) -------------------
+# ------------------- ROUTES -------------------
 @app.route('/')
 def index():
     return redirect(url_for('login'))
@@ -221,5 +217,8 @@ def history():
         results = AnalysisResult.query.filter_by(user_id=current_user.id).order_by(AnalysisResult.uploaded_at.desc()).all()
     return render_template('history.html', results=results)
 
+# ------------------- RUN APP (production ready) -------------------
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_DEBUG', 'False') == 'True'
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
